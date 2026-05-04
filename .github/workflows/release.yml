@@ -26,19 +26,23 @@ jobs:
       - name: Build debug APK
         run: ./gradlew assembleDebug
 
-      - name: Get version name
+      - name: Get version info
         id: version
         run: |
-          VERSION=$(grep 'versionName' app/build.gradle | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          VERSION=$(./gradlew -q printVersionName 2>/dev/null || grep -oP '(?<=versionName ")[^"]+' app/build.gradle | head -1)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          # Extract only the current version section from CHANGELOG.md
+          awk "/^## $VERSION/{found=1; next} found && /^## /{exit} found{print}" CHANGELOG.md > /tmp/release_notes.md
+          # Fall back to full changelog if no section found
+          if [ ! -s /tmp/release_notes.md ]; then cp CHANGELOG.md /tmp/release_notes.md; fi
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.version.outputs.version) }}
           name: v${{ steps.version.outputs.version }}
-          body_path: CHANGELOG.md
+          body_path: /tmp/release_notes.md
           draft: false
           prerelease: false
           make_latest: true
-          files: app/build/outputs/apk/debug/eruda-v${{ steps.version.outputs.version }}-debug.apk
+          files: app/build/outputs/apk/debug/*-debug.apk
