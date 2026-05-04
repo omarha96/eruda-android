@@ -1,11 +1,14 @@
 package io.liriliri.eruda
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.KeyEvent
@@ -16,8 +19,10 @@ import android.webkit.*
 import android.widget.EditText
 import android.widget.ImageView
 import android.widget.ProgressBar
+import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewFeature
@@ -39,6 +44,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var manager: InputMethodManager
     private val TAG = "Eruda.MainActivity"
     var mFilePathCallback: ValueCallback<Array<Uri>>? = null
+    private var pendingFileUrl: String? = null
+
+    private val storagePermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            val url = pendingFileUrl
+            pendingFileUrl = null
+            if (granted && url != null) {
+                webView.loadUrl(url)
+            } else if (url != null) {
+                Toast.makeText(this, R.string.storage_permission_denied, Toast.LENGTH_SHORT).show()
+            }
+        }
     override fun onCreate(savedInstanceState: Bundle?) {
         installSplashScreen()
 
@@ -67,7 +84,7 @@ class MainActivity : AppCompatActivity() {
                     manager.hideSoftInputFromWindow(textUrl.applicationWindowToken, 0)
                 }
                 var input = textUrl.text.toString()
-                if (!isHttpUrl(input)) {
+                if (!isHttpUrl(input) && !isFileUrl(input)) {
                     if (mayBeUrl(input)) {
                         input = "https://${input}"
                     } else {
@@ -79,7 +96,11 @@ class MainActivity : AppCompatActivity() {
                         input = "https://www.google.com/search?q=${input}"
                     }
                 }
-                webView.loadUrl(input)
+                if (isFileUrl(input)) {
+                    loadFileUrl(input)
+                } else {
+                    webView.loadUrl(input)
+                }
                 textUrl.clearFocus()
             } else {
                 webView.reload()
@@ -124,7 +145,7 @@ class MainActivity : AppCompatActivity() {
             ): Boolean {
                 val url = request.url.toString()
 
-                if (isHttpUrl(url)) {
+                if (isHttpUrl(url) || isFileUrl(url)) {
                     return false
                 }
 
@@ -217,7 +238,7 @@ class MainActivity : AppCompatActivity() {
                             window.define = null;
                         }
                         var script = document.createElement('script'); 
-                        script.src = '//cdn.jsdelivr.net/npm/eruda'; 
+                        script.src = 'https://cdn.jsdelivr.net/npm/eruda'; 
                         document.body.appendChild(script); 
                         script.onload = function () { 
                             eruda.init();
@@ -281,6 +302,7 @@ class MainActivity : AppCompatActivity() {
         settings.javaScriptEnabled = true
         settings.domStorageEnabled = true
         settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+        settings.allowFileAccess = true
 
         if (resources.getString(R.string.mode) == "night") {
             // https://stackoverflow.com/questions/57449900/letting-webview-on-android-work-with-prefers-color-scheme-dark
@@ -299,6 +321,19 @@ class MainActivity : AppCompatActivity() {
         }
 
         webView.loadUrl("https://github.com/liriliri/eruda")
+    }
+
+    private fun loadFileUrl(url: String) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            webView.loadUrl(url)
+        } else {
+            pendingFileUrl = url
+            storagePermissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
     }
 
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
@@ -327,6 +362,10 @@ class MainActivity : AppCompatActivity() {
 
 fun isHttpUrl(url: String): Boolean {
     return url.startsWith("http:") || url.startsWith("https:")
+}
+
+fun isFileUrl(url: String): Boolean {
+    return url.startsWith("file://")
 }
 
 fun mayBeUrl(text: String): Boolean {
