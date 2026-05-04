@@ -52,7 +52,7 @@ class MainActivity : AppCompatActivity() {
             pendingFileUrl = null
             if (granted && url != null) {
                 webView.loadUrl(url)
-            } else {
+            } else if (url != null) {
                 Toast.makeText(this, R.string.storage_permission_denied, Toast.LENGTH_SHORT).show()
             }
         }
@@ -365,7 +365,7 @@ fun isHttpUrl(url: String): Boolean {
 }
 
 fun isFileUrl(url: String): Boolean {
-    return url.startsWith("file:")
+    return url.startsWith("file://")
 }
 
 fun mayBeUrl(text: String): Boolean {
