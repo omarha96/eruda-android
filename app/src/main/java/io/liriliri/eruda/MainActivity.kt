@@ -162,8 +162,15 @@ class MainActivity : AppCompatActivity() {
                 view: WebView,
                 request: WebResourceRequest
             ): WebResourceResponse? {
+                val url = request.url.toString()
+
+                // Serve file:// URLs via the app process to bypass the WebView renderer
+                // sandbox, which lacks direct access to external storage on Android 10+.
+                if (isFileUrl(url)) {
+                    return serveFileUrl(request.url)
+                }
+
                 if (request.isForMainFrame) {
-                    val url = request.url.toString()
                     if (!isHttpUrl(url)) {
                         return null
                     }
@@ -303,6 +310,8 @@ class MainActivity : AppCompatActivity() {
         settings.domStorageEnabled = true
         settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
         settings.allowFileAccess = true
+        @Suppress("DEPRECATION")
+        settings.allowUniversalAccessFromFileURLs = true
 
         if (resources.getString(R.string.mode) == "night") {
             // https://stackoverflow.com/questions/57449900/letting-webview-on-android-work-with-prefers-color-scheme-dark
@@ -321,6 +330,35 @@ class MainActivity : AppCompatActivity() {
         }
 
         webView.loadUrl("https://github.com/liriliri/eruda")
+    }
+
+    private fun serveFileUrl(uri: android.net.Uri): WebResourceResponse? {
+        return try {
+            val path = uri.path ?: return null
+            // Canonicalize to resolve '..' sequences and prevent path traversal.
+            val file = java.io.File(path).canonicalFile
+            if (!file.exists() || !file.canRead()) return null
+            val ext = file.extension.lowercase()
+            val mimeType = when (ext) {
+                "html", "htm" -> "text/html"
+                "js", "mjs" -> "application/javascript"
+                "css" -> "text/css"
+                "json" -> "application/json"
+                "xml" -> "text/xml"
+                "txt" -> "text/plain"
+                "png" -> "image/png"
+                "jpg", "jpeg" -> "image/jpeg"
+                "gif" -> "image/gif"
+                "svg" -> "image/svg+xml"
+                "webp" -> "image/webp"
+                else -> android.webkit.MimeTypeMap.getSingleton()
+                    .getMimeTypeFromExtension(ext) ?: "application/octet-stream"
+            }
+            WebResourceResponse(mimeType, "utf-8", java.io.FileInputStream(file))
+        } catch (e: Exception) {
+            Log.e(TAG, "Error serving file URL: ${e.message}")
+            null
+        }
     }
 
     private fun loadFileUrl(url: String) {
