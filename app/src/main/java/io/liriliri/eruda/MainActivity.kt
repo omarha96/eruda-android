@@ -10,6 +10,8 @@ import android.graphics.Rect
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
 import android.util.Log
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -45,6 +47,8 @@ class MainActivity : AppCompatActivity() {
     private val TAG = "Eruda.MainActivity"
     var mFilePathCallback: ValueCallback<Array<Uri>>? = null
     private var pendingFileUrl: String? = null
+    /** True while waiting for the user to return from the "All Files Access" settings screen. */
+    private var pendingAllFilesAccess = false
 
     private val storagePermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -162,8 +166,15 @@ class MainActivity : AppCompatActivity() {
                 view: WebView,
                 request: WebResourceRequest
             ): WebResourceResponse? {
+                val url = request.url.toString()
+
+                // Serve file:// URLs via the app process to bypass the WebView renderer
+                // sandbox, which lacks direct access to external storage on Android 10+.
+                if (isFileUrl(url)) {
+                    return serveFileUrl(request.url)
+                }
+
                 if (request.isForMainFrame) {
-                    val url = request.url.toString()
                     if (!isHttpUrl(url)) {
                         return null
                     }
@@ -303,6 +314,8 @@ class MainActivity : AppCompatActivity() {
         settings.domStorageEnabled = true
         settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
         settings.allowFileAccess = true
+        @Suppress("DEPRECATION")
+        settings.allowUniversalAccessFromFileURLs = true
 
         if (resources.getString(R.string.mode) == "night") {
             // https://stackoverflow.com/questions/57449900/letting-webview-on-android-work-with-prefers-color-scheme-dark
@@ -323,16 +336,92 @@ class MainActivity : AppCompatActivity() {
         webView.loadUrl("https://github.com/liriliri/eruda")
     }
 
+    private fun serveFileUrl(uri: android.net.Uri): WebResourceResponse? {
+        return try {
+            val path = uri.path ?: return null
+            // Canonicalize to resolve '..' sequences and prevent path traversal.
+            val file = java.io.File(path).canonicalFile
+            if (!file.exists() || !file.canRead()) return null
+            val ext = file.extension.lowercase()
+            val mimeType = when (ext) {
+                "html", "htm" -> "text/html"
+                "js", "mjs" -> "application/javascript"
+                "css" -> "text/css"
+                "json" -> "application/json"
+                "xml" -> "text/xml"
+                "txt" -> "text/plain"
+                "png" -> "image/png"
+                "jpg", "jpeg" -> "image/jpeg"
+                "gif" -> "image/gif"
+                "svg" -> "image/svg+xml"
+                "webp" -> "image/webp"
+                else -> android.webkit.MimeTypeMap.getSingleton()
+                    .getMimeTypeFromExtension(ext) ?: "application/octet-stream"
+            }
+            WebResourceResponse(mimeType, "utf-8", java.io.FileInputStream(file))
+        } catch (e: Exception) {
+            Log.e(TAG, "Error serving file URL: ${e.message}")
+            null
+        }
+    }
+
     private fun loadFileUrl(url: String) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU ||
-            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE)
-            == PackageManager.PERMISSION_GRANTED
-        ) {
-            webView.loadUrl(url)
-        } else {
-            pendingFileUrl = url
-            storagePermissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
+        when {
+            // Android 11+ (API 30+): READ_EXTERNAL_STORAGE no longer covers non-media files
+            // (e.g. HTML, JS, CSS) in shared storage. "All Files Access" is required.
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R -> {
+                if (Environment.isExternalStorageManager()) {
+                    webView.loadUrl(url)
+                } else {
+                    pendingFileUrl = url
+                    Toast.makeText(this, R.string.all_files_access_required, Toast.LENGTH_LONG).show()
+                    try {
+                        startActivity(
+                            Intent(
+                                Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                Uri.parse("package:$packageName")
+                            )
+                        )
+                        pendingAllFilesAccess = true
+                    } catch (e: Exception) {
+                        try {
+                            startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                            pendingAllFilesAccess = true
+                        } catch (e2: Exception) {
+                            pendingFileUrl = null
+                            Toast.makeText(this, R.string.storage_permission_denied, Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            }
+            // Android 6–10 (API 23–29): use READ_EXTERNAL_STORAGE runtime permission
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.M -> {
+                if (ContextCompat.checkSelfPermission(
+                        this, Manifest.permission.READ_EXTERNAL_STORAGE
+                    ) == PackageManager.PERMISSION_GRANTED
+                ) {
+                    webView.loadUrl(url)
+                } else {
+                    pendingFileUrl = url
+                    storagePermissionLauncher.launch(Manifest.permission.READ_EXTERNAL_STORAGE)
+                }
+            }
+            // Below Android 6: no runtime permission needed
+            else -> webView.loadUrl(url)
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        // Retry loading a pending file:// URL when the user returns from the
+        // "All Files Access" settings screen having granted the permission.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && pendingAllFilesAccess) {
+            pendingAllFilesAccess = false
+            val url = pendingFileUrl
+            if (url != null && Environment.isExternalStorageManager()) {
+                pendingFileUrl = null
+                webView.loadUrl(url)
+            }
         }
     }
 
