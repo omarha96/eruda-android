@@ -1,6 +1,7 @@
-## 1.2.1 (4 May 2026)
+## 1.2.1 (5 May 2026)
 
-* fix: file:/// access denied on Android 10+ (serve via app process in shouldInterceptRequest)
+* fix: file:/// ERR_ACCESS_DENIED on Android 11+ — added MANAGE_EXTERNAL_STORAGE ("All Files Access") permission
+* fix: file:/// ERR_ACCESS_DENIED on Android 10 — serve local files via app process in shouldInterceptRequest
 * fix: allow universal file access for JS cross-file references in local pages
 
 ## 1.2.0 (21 Dec 2023)
