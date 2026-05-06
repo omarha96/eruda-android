@@ -31,6 +31,9 @@ import androidx.webkit.WebViewFeature
 import okhttp3.Headers.Companion.toHeaders
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
 import java.io.UnsupportedEncodingException
 import java.net.URLEncoder
 
@@ -47,6 +50,53 @@ class MainActivity : AppCompatActivity() {
     private val TAG = "Eruda.MainActivity"
     var mFilePathCallback: ValueCallback<Array<Uri>>? = null
     private var pendingFileUrl: String? = null
+
+    // Feature 1: in-memory console-log session storage (persists across page navigations).
+    // Access is guarded by synchronized blocks in storeLog / getLogs.
+    private val MAX_CONSOLE_ENTRIES = 500
+    private val consoleLogs = mutableListOf<Map<String, String>>()
+
+    // Feature 2: local cache for the eruda script (avoids re-downloading on each page load).
+    // The explicit /eruda.js path is used so jsDelivr returns the JS directly without a redirect.
+    private val ERUDA_CDN_URL = "https://cdn.jsdelivr.net/npm/eruda/eruda.js"
+    private val CACHE_MAX_AGE_MS = 7 * 24 * 3600 * 1000L  // 7 days
+    private val erudaScriptCacheFile: File by lazy { File(filesDir, "eruda_cache.js") }
+    // Shared OkHttpClient for eruda script downloads (reuses connection pool).
+    private val httpClient = OkHttpClient()
+
+    /** JavaScript-to-Android bridge exposed as `window.ErudaAndroid`. */
+    inner class ErudaBridge {
+        @android.webkit.JavascriptInterface
+        fun storeLog(level: String, args: String) {
+            val entry = mapOf(
+                "level" to level,
+                "args" to args,
+                "time" to System.currentTimeMillis().toString()
+            )
+            synchronized(consoleLogs) {
+                consoleLogs.add(entry)
+                if (consoleLogs.size > MAX_CONSOLE_ENTRIES) {
+                    consoleLogs.removeAt(0)
+                }
+            }
+        }
+
+        @android.webkit.JavascriptInterface
+        fun getLogs(): String {
+            val json = JSONArray()
+            synchronized(consoleLogs) {
+                consoleLogs.forEach { log ->
+                    val obj = JSONObject()
+                    obj.put("level", log["level"] ?: "log")
+                    obj.put("args", log["args"] ?: "")
+                    obj.put("time", log["time"] ?: "0")
+                    json.put(obj)
+                }
+            }
+            return json.toString()
+        }
+    }
+
     /** True while waiting for the user to return from the "All Files Access" settings screen. */
     private var pendingAllFilesAccess = false
 
@@ -174,6 +224,11 @@ class MainActivity : AppCompatActivity() {
                     return serveFileUrl(request.url)
                 }
 
+                // Feature 2: serve the eruda script from local cache to avoid re-downloading.
+                if (url.startsWith(ERUDA_CDN_URL)) {
+                    return serveCachedErudaScript()
+                }
+
                 if (request.isForMainFrame) {
                     if (!isHttpUrl(url)) {
                         return null
@@ -249,12 +304,52 @@ class MainActivity : AppCompatActivity() {
                             window.define = null;
                         }
                         var script = document.createElement('script'); 
-                        script.src = 'https://cdn.jsdelivr.net/npm/eruda'; 
+                        script.src = 'https://cdn.jsdelivr.net/npm/eruda/eruda.js'; 
                         document.body.appendChild(script); 
                         script.onload = function () { 
                             eruda.init();
                             if (define) {
                                 window.define = define;
+                            }
+                            if (window.ErudaAndroid) {
+                                // Capture eruda's already-hooked console methods before our wrapping.
+                                var _eruda = {};
+                                ['log','warn','error','info','debug'].forEach(function(lvl) {
+                                    _eruda[lvl] = console[lvl].bind(console);
+                                });
+                                // Wrap each method so new logs are forwarded to Android storage.
+                                ['log','warn','error','info','debug'].forEach(function(lvl) {
+                                    (function(l, orig) {
+                                        console[l] = function() {
+                                            orig.apply(console, arguments);
+                                            try {
+                                                var msg = Array.prototype.slice.call(arguments).map(function(a) {
+                                                    try { return typeof a === 'string' ? a : JSON.stringify(a); }
+                                                    catch(e) { return String(a); }
+                                                }).join(' ');
+                                                window.ErudaAndroid.storeLog(l, msg);
+                                            } catch(e) {}
+                                        };
+                                    })(lvl, _eruda[lvl]);
+                                });
+                                // Replay persisted logs from previous pages directly into eruda
+                                // via the pre-wrap console references (_eruda) so they appear in
+                                // the UI without going through our persistence wrapper, which
+                                // prevents duplicate entries on subsequent page reloads.
+                                // '\u23f0' (⏰) visually marks replayed historical entries.
+                                try {
+                                    var stored = JSON.parse(window.ErudaAndroid.getLogs() || '[]');
+                                    stored.forEach(function(entry) {
+                                        var lvl = entry.level;
+                                        if (_eruda[lvl]) {
+                                            _eruda[lvl](
+                                                '\u23f0 ' +
+                                                new Date(parseInt(entry.time, 10)).toLocaleTimeString() +
+                                                ' ' + entry.args
+                                            );
+                                        }
+                                    });
+                                } catch(e) {}
                             }
                         }
                     })();
@@ -317,6 +412,9 @@ class MainActivity : AppCompatActivity() {
         @Suppress("DEPRECATION")
         settings.allowUniversalAccessFromFileURLs = true
 
+        // Register the Android bridge so JavaScript can call window.ErudaAndroid.*
+        webView.addJavascriptInterface(ErudaBridge(), "ErudaAndroid")
+
         if (resources.getString(R.string.mode) == "night") {
             // https://stackoverflow.com/questions/57449900/letting-webview-on-android-work-with-prefers-color-scheme-dark
             val supportForceDarkStrategy =
@@ -362,6 +460,65 @@ class MainActivity : AppCompatActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "Error serving file URL: ${e.message}")
             null
+        }
+    }
+
+    /**
+     * Feature 2: serve the eruda script from a local cache to avoid re-downloading it on every
+     * page load.  The cache is stored in the app's private files directory and refreshed after
+     * [CACHE_MAX_AGE_MS].  A stale cache is used as a fallback when the network is unavailable.
+     */
+    private fun serveCachedErudaScript(): WebResourceResponse? {
+        val headers = mapOf("Access-Control-Allow-Origin" to "*")
+
+        // Serve from cache if it exists and is not stale.
+        if (erudaScriptCacheFile.exists() &&
+            System.currentTimeMillis() - erudaScriptCacheFile.lastModified() < CACHE_MAX_AGE_MS
+        ) {
+            Log.i(TAG, "Serving eruda script from cache")
+            return WebResourceResponse(
+                "application/javascript", "utf-8", 200, "OK",
+                headers, erudaScriptCacheFile.inputStream()
+            )
+        }
+
+        // Download from CDN, save to cache, and serve.
+        // Note: shouldInterceptRequest is called on a background thread by WebView, so
+        // blocking network I/O here is safe and does not block the main thread.
+        Log.i(TAG, "Downloading eruda script from CDN")
+        return try {
+            val req = Request.Builder().url(ERUDA_CDN_URL).build()
+            val bytes = httpClient.newCall(req).execute().use { response ->
+                if (!response.isSuccessful) {
+                    Log.e(TAG, "Eruda CDN returned HTTP ${response.code} ${response.message}")
+                    return@use null
+                }
+                response.body?.bytes().also {
+                    if (it == null) Log.e(TAG, "Empty response body from eruda CDN")
+                }
+            } ?: return null
+            try {
+                erudaScriptCacheFile.writeBytes(bytes)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to write eruda script cache: ${e.message}")
+            }
+            WebResourceResponse(
+                "application/javascript", "utf-8", 200, "OK",
+                headers, bytes.inputStream()
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to download eruda script: ${e.message}")
+            // Fall back to a stale cached copy rather than failing completely.
+            if (erudaScriptCacheFile.exists()) {
+                Log.i(TAG, "Serving stale eruda script from cache")
+                WebResourceResponse(
+                    "application/javascript", "utf-8", 200, "OK",
+                    headers, erudaScriptCacheFile.inputStream()
+                )
+            } else {
+                Log.e(TAG, "Eruda script unavailable: network error and no local cache")
+                null
+            }
         }
     }
 
