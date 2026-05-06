@@ -42,29 +42,23 @@ jobs:
           # Fall back to full changelog if no section found
           if [ ! -s /tmp/release_notes.md ]; then cp CHANGELOG.md /tmp/release_notes.md; fi
 
-      - name: Check if release already exists
-        id: check_release
+      - name: Enforce new version for new release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="v${{ steps.version.outputs.version }}"
-          # When triggered by a tag push, always publish (this is an explicit release action)
+          # When triggered by a tag push, always publish (explicit release intent)
           if [ "${{ github.ref_type }}" = "tag" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # When triggered by a branch push, skip if the tag already exists to avoid
-          # overwriting a previously published release with unrelated code changes
+          # When triggered by a branch push, fail if the tag already exists.
+          # Every new set of features must ship under a new version number.
           if gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
-            echo "Release $TAG already exists — skipping to avoid overwriting it."
-            echo "Bump versionName in app/build.gradle to publish a new release."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "::error::Release $TAG already exists. Bump versionName (and versionCode) in app/build.gradle before merging new features."
+            exit 1
           fi
 
       - name: Create GitHub Release
-        if: steps.check_release.outputs.skip != 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.version.outputs.version) }}
