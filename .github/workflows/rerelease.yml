@@ -1,0 +1,62 @@
+name: Re-release from commit
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag to rebuild (e.g. v1.2.1). WARNING: the tag will be force-moved to the given commit.'
+        required: true
+      commit_sha:
+        description: 'Full or short commit SHA the release should be built from (e.g. 7668972)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  rerelease:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout target commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.commit_sha }}
+          fetch-depth: 0
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build release APK
+        run: ./gradlew assembleRelease
+
+      - name: Re-point tag to target commit
+        run: |
+          git tag -f "${{ github.event.inputs.tag_name }}" "${{ github.event.inputs.commit_sha }}"
+          git push origin "${{ github.event.inputs.tag_name }}" --force
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload APK to existing release (replace old asset)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag_name }}"
+          APK=$(find app/build/outputs/apk/release -name '*-release.apk' | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::No release APK found under app/build/outputs/apk/release/"
+            exit 1
+          fi
+          # Remove any existing APK assets so the upload doesn't fail on duplicates
+          gh release view "$TAG" --repo "${{ github.repository }}" --json assets \
+            --jq '.assets[].name' | while IFS= read -r name; do
+              gh release delete-asset "$TAG" "$name" --repo "${{ github.repository }}" --yes 2>/dev/null || true
+            done
+          gh release upload "$TAG" "$APK" --repo "${{ github.repository }}" --clobber
+          echo "APK uploaded to release $TAG from commit ${{ github.event.inputs.commit_sha }}"

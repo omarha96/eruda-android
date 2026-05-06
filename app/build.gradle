@@ -10,8 +10,8 @@ android {
         applicationId "io.liriliri.eruda"
         minSdk 21
         targetSdk 33
-        versionCode 3
-        versionName "1.2.1"
+        versionCode 4
+        versionName "1.2.2"
         archivesBaseName = "eruda-v$versionName"
     }
 
